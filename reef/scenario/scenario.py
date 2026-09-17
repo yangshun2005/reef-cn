@@ -1,0 +1,257 @@
+"""Scenario aggregate and its durable recovery metadata."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import Any
+
+from reef.artifact.artifact import Artifact, ArtifactRef
+from reef.artifact.release_chain import ArtifactReleaseChain, ReleaseNotRestorable
+from reef.artifact.repository import Repository
+from reef.core.reports import ReportBase
+from reef.inference.model_config import ModelConfig
+from reef.observability.operations import OperationMetrics
+from reef.recipe.checkpoint_strategy import CheckpointStrategy
+from reef.runtime.interfaces import InferenceHandler, InferenceRuntime, TrainingRuntime
+from reef.scenario.binding import ScenarioBinding
+from reef.scenario.committer import ScenarioCommitter
+from reef.storage.commits import SCENARIO_METADATA_KEY, CommitRecord, scenario_metadata_for
+from reef.storage.records import RecordStore
+from reef.storage.scenario import ScenarioStore
+from reef.surface.base import Surface
+from reef.train.backend import StepExecution
+from reef.train.trainer import Trainer
+from reef.train.types import TrainingBatch, TrainStepResult
+
+
+class Scenario:
+    """Scenario aggregate owning one runtime binding and release chain."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        binding: ScenarioBinding,
+        repository: Repository,
+        checkpoint_strategy: CheckpointStrategy,
+        store: ScenarioStore,
+        trainer: Trainer,
+        model_config: ModelConfig | None = None,
+        scenario_step: int = 0,
+        process_id: str | None = None,
+        recovered_head_record: CommitRecord | None = None,
+    ) -> None:
+        self.operations = OperationMetrics(
+            ("serve/request", "serve/admission", "ingest/write"),
+            counters=(
+                "serve/retries_total",
+                "serve/version_mismatch_total",
+                "serve/timeouts_total",
+                "ingest/accepted_total",
+                "ingest/duplicates_total",
+                "ingest/rejected_report_total",
+                "ingest/rejected_conflict_total",
+                "ingest/rejected_request_total",
+            ),
+        )
+        self._name = name
+        self._binding = binding
+        self.model_config = model_config or ModelConfig()
+        self._surface = binding.surface
+        self._store = store
+        self._closed = False
+        self._trainer = trainer
+        self._artifact_chain = ArtifactReleaseChain(repository, process_id=process_id)
+        self._committer = ScenarioCommitter(
+            name=name,
+            binding=binding,
+            artifacts=self._artifact_chain,
+            checkpoint_strategy=checkpoint_strategy,
+            trainer=trainer,
+            scenario_step=scenario_step,
+            store=store,
+            recovered_head_record=recovered_head_record,
+        )
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def training_runtime(self) -> TrainingRuntime | None:
+        return self._binding.training_runtime
+
+    @property
+    def runtime(self) -> InferenceRuntime | None:
+        """Inference or training runtime bound to this scenario."""
+        return self.model_config.runtime or self._binding.runtime
+
+    @property
+    def report_type(self) -> type[ReportBase] | None:
+        """The recipe's declared report contract, enforced at ingress when set."""
+        return self._binding.report_type
+
+    @property
+    def inference_handler(self) -> InferenceHandler | None:
+        runtime = self.model_config.runtime
+        return runtime.inference_handler if runtime is not None else self._binding.inference_handler
+
+    @property
+    def repository(self) -> Repository:
+        """The release chain's scenario-scoped artifact repository.
+
+        The public read path to artifact heads (base, current, checkpoint);
+        mutation goes through Scenario methods so it stays serialized with
+        rollback and commit.
+        """
+        return self._artifact_chain.repository
+
+    @property
+    def records(self) -> RecordStore:
+        return self._store.records
+
+    @property
+    def store(self) -> ScenarioStore:
+        """The scenario's record and commit storage session."""
+        return self._store
+
+    @property
+    def trainer(self) -> Trainer:
+        """Inspection-only view of the trainer.
+
+        Every mutating path goes through a Scenario method so it is serialized
+        against rollback and commit by the committer lock. Reading state
+        that is not part of a transaction (objective identity, consumption
+        watermarks, processor schema) is safe here; do not reserve batches,
+        replace results, or compact through this handle.
+        """
+        return self._trainer
+
+    @property
+    def scenario_step(self) -> int:
+        return self._committer.step
+
+    @property
+    def surface(self) -> Surface:
+        """The serving surface built for this scenario."""
+        return self._surface
+
+    def set_training_mode(self, training_mode: str) -> None:
+        """Select future batches without waiting for a running backend step."""
+        self._trainer.set_training_mode(training_mode)
+
+    def prepare_training_step(self) -> TrainStepResult | None:
+        """Prepare one local-backend step while excluding rollback and commit."""
+        with self._committer.lock:
+            return self._trainer.run_once(self.scenario_step)
+
+    def reserve_training_batch(self) -> TrainingBatch | None:
+        """Reserve one backend-training batch while excluding rollback and commit."""
+        with self._committer.lock:
+            return self._trainer.reserve_training_batch()
+
+    def execute_reserved_training_step(self) -> StepExecution:
+        """Run the bound dispatched backend for the reserved batch."""
+        return self._trainer.execute_reserved_step(self.scenario_step)
+
+    def reject_pending(self, metrics: Mapping[str, Any] | None = None) -> None:
+        """Drop the reserved batch and durably compact whatever it released."""
+        with self._committer.lock:
+            self._trainer.reject_pending(metrics)
+
+    def reingest(self, *, up_to_sequence: int, consumed_ids: frozenset[str]) -> None:
+        """Rebuild processor memory from retained rows behind a recovered watermark."""
+        with self._committer.lock:
+            self._trainer.reingest(up_to_sequence=up_to_sequence, consumed_ids=consumed_ids)
+
+    def restore_record_progress(self, *, after_sequence: int, offset: int) -> None:
+        """Resume record consumption at a recovered commit's high-water mark."""
+        with self._committer.lock:
+            self._trainer.restore_record_progress(after_sequence=after_sequence, offset=offset)
+
+    @property
+    def commit_status(self) -> Mapping[str, Any]:
+        """The non-blocking committed step, training outcome, and artifact-head sync status."""
+        return self._committer.commit_status
+
+    @property
+    def committed_training_job_id(self) -> str | None:
+        """Training-job identity proven by the current durable commit."""
+        with self._committer.lock:
+            records = self._store.history() if self._store.durable else ()
+            if not records or records[-1].step != self.scenario_step:
+                return None
+            return records[-1].training_job_id
+
+    @property
+    def committed_training_without_job_id(self) -> bool:
+        """Whether the current head is a pre-identity training commit."""
+        with self._committer.lock:
+            records = self._store.history() if self._store.durable else ()
+            if not records or records[-1].step != self.scenario_step:
+                return False
+            record = records[-1]
+            return record.operation == "training" and record.operation_verified and record.training_job_id is None
+
+    def metrics_for_version(self, release_id: str) -> Mapping[str, Any] | None:
+        """Metrics of the training step that published ``release_id``, if logged."""
+        return self._committer.metrics_for_version(release_id)
+
+    def releases(self) -> tuple[dict[str, Any], ...]:
+        return self._committer.releases()
+
+    def artifact_for_version(self, release_id: str) -> Artifact:
+        """Materialize a scenario release for read-only serving; absence raises ArtifactNotFound."""
+        return self._committer.artifact_for_version(release_id)
+
+    def entries_for_version(self, release_id: str) -> tuple[Mapping[str, Any], ...] | None:
+        """The composition entries behind a scenario release, if its training commit logged them."""
+        return self._committer.entries_for_version(release_id)
+
+    def artifact_with_metrics(
+        self,
+        release_id: str | None = None,
+    ) -> tuple[Artifact, Mapping[str, Any] | None]:
+        """Freeze one artifact and its gate metrics without waiting for preparation."""
+        return self._committer.artifact_with_metrics(release_id)
+
+    def current_artifact_ref(self) -> ArtifactRef:
+        return self._artifact_chain.current
+
+    def rollback(self, release_id: str, *, operation: str = "rollback") -> ArtifactRef:
+        return self._committer.rollback(release_id, operation=operation)
+
+    def commit(self, result: TrainStepResult) -> Any:
+        return self._committer.commit(result)
+
+    def close(self) -> None:
+        """Tear down what this scenario instance owns: trainer, then its storage session.
+
+        The dispatcher calls this on shutdown and when a durable reload
+        replaces the instance — the one guarantee processors with background
+        workers rely on (see :meth:`DataProcessor.close`). Safe to call more
+        than once; the trainer closes first so no processor thread can touch
+        the record store after it closes.
+        """
+        with self._committer.lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self._trainer.close()
+            finally:
+                self._store.close()
+
+    def to_metadata(self) -> dict[str, object]:
+        return scenario_metadata_for(
+            name=self.name,
+            base_artifact=self.repository.base_artifact,
+            scenario_step=self.scenario_step,
+        )
+
+
+__all__ = [
+    "SCENARIO_METADATA_KEY",
+    "ReleaseNotRestorable",
+    "Scenario",
+]

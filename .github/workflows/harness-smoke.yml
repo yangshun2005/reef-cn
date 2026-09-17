@@ -1,0 +1,184 @@
+name: harness-smoke
+
+# Runs the real pinned pi, codex, dsh, and hermes binaries through render,
+# run_episode, and the trajectory reader against a stub model server
+# (tests/smoke/): the guard against a release changing a format the hermetic
+# fakes only imitate.
+# Non-blocking: not in the required check set until stable.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    # Subscribe to every update so removing the last matching file still
+    # cancels an older run. Decide whether smoke tests apply inside the job.
+    if: '!github.event.pull_request.draft'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      smoke: ${{ steps.paths.outputs.smoke }}
+    steps:
+      - name: Check whether harness smoke tests apply
+        id: paths
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            echo "smoke=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files" \
+            --jq '.[] | .filename, (.previous_filename // empty)')
+          smoke=false
+          while IFS= read -r file; do
+            case "$file" in
+              reef/harness/*|reef/train/cordis_backend/*|tests/smoke/*|.github/workflows/harness-smoke.yml)
+                smoke=true ;;
+            esac
+          done <<< "$files"
+          echo "smoke=$smoke" >> "$GITHUB_OUTPUT"
+
+  real-pi:
+    needs: [changes]
+    if: needs.changes.outputs.smoke == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: git submodule update --init third_party/reef-client
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+      - run: python -m pip install ./third_party/reef-client
+      - run: python -m pip install -e . aiohttp pyyaml huggingface_hub pytest
+      - run: npm install --prefix "$RUNNER_TEMP/pi" @earendil-works/pi-coding-agent@0.84.2
+      - run: python -m pytest tests/smoke/test_real_pi.py
+        env:
+          REEF_REAL_PI_BINARY: ${{ runner.temp }}/pi/node_modules/.bin/pi
+          REEF_REAL_PI_SESSION_OUT: ${{ runner.temp }}/real-pi-session.jsonl
+      # The raw session the episode wrote: the refresh source for the
+      # hermetic fixture at tests/reef_service/data/pi_session_real/.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: real-pi-session
+          path: ${{ runner.temp }}/real-pi-session.jsonl
+          if-no-files-found: error
+
+  # The same guard for the pinned Codex CLI (tests/smoke/test_real_codex.py).
+  real-codex:
+    needs: [changes]
+    if: needs.changes.outputs.smoke == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: git submodule update --init third_party/reef-client
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+      - run: python -m pip install ./third_party/reef-client
+      - run: python -m pip install -e . aiohttp pyyaml huggingface_hub pytest
+      - run: npm install --prefix "$RUNNER_TEMP/codex" @openai/codex@0.152.1
+      - run: python -m pytest tests/smoke/test_real_codex.py
+        env:
+          REEF_REAL_CODEX_BINARY: ${{ runner.temp }}/codex/node_modules/.bin/codex
+          REEF_REAL_CODEX_SESSION_OUT: ${{ runner.temp }}/real-codex-session.jsonl
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: real-codex-session
+          path: ${{ runner.temp }}/real-codex-session.jsonl
+          if-no-files-found: error
+
+  # The same guard for the pinned DeepSeek Harness (tests/smoke/test_real_dsh.py).
+  real-dsh:
+    needs: [changes]
+    if: needs.changes.outputs.smoke == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: git submodule update --init third_party/reef-client
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+      - run: python -m pip install ./third_party/reef-client
+      - run: python -m pip install -e . aiohttp pyyaml huggingface_hub pytest
+      - run: npm install --prefix "$RUNNER_TEMP/dsh" @deepseek-ai/dsh@0.1.2-alpha.5
+      - run: python -m pytest tests/smoke/test_real_dsh.py
+        env:
+          REEF_REAL_DSH_BINARY: ${{ runner.temp }}/dsh/node_modules/.bin/dsh
+
+  # The same guard for the pinned Hermes Agent (tests/smoke/test_real_hermes.py):
+  # the vendor's channel is a git checkout installed editable into a venv.
+  real-hermes:
+    needs: [changes]
+    if: needs.changes.outputs.smoke == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: git submodule update --init third_party/reef-client
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install ./third_party/reef-client
+      - run: python -m pip install -e . aiohttp pyyaml huggingface_hub pytest
+      - run: |
+          git clone --quiet --depth 1 --branch v2026.8.31 https://github.com/NousResearch/hermes-agent "$RUNNER_TEMP/hermes/src"
+          rm -rf "$RUNNER_TEMP/hermes/src/.git"
+          python3 -m venv "$RUNNER_TEMP/hermes/venv"
+          "$RUNNER_TEMP/hermes/venv/bin/python" -m pip install --quiet -e "$RUNNER_TEMP/hermes/src"
+      - run: python -m pytest tests/smoke/test_real_hermes.py
+        env:
+          REEF_REAL_HERMES_BINARY: ${{ runner.temp }}/hermes/venv/bin/hermes
+
+  # The same guard for Terminus 2 (tests/reef_service/test_terminus_agent.py),
+  # whose real dependency is a Python package rather than a pinned binary: that
+  # harbor still accepts the trial the runner builds and resolves its skill
+  # roots. A full episode needs Docker and a model, so it stays the opt-in
+  # tests/smoke/test_real_terminus.py.
+  real-terminus:
+    needs: [changes]
+    if: needs.changes.outputs.smoke == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: git submodule update --init third_party/reef-client
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: python -m pip install ./third_party/reef-client
+      - run: python -m pip install -e . pytest
+      - run: python -m pytest tests/reef_service/test_terminus_agent.py -v

@@ -1,0 +1,343 @@
+from __future__ import annotations
+
+import base64
+import json
+import os
+import shutil
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+import pytest
+
+from reef.artifact import Artifact, ArtifactConflict, ArtifactSourceError, GitLFSRepositoryBackend
+
+
+def run_git(*args: str, cwd: Path | None = None) -> str:
+    return subprocess.run(
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+@pytest.mark.integration
+def test_git_lfs_repository_initializes_default_local_repository(
+    tmp_path: Path,
+    fake_git_lfs: None,
+) -> None:
+    remote = tmp_path / "artifacts.git"
+
+    backend = GitLFSRepositoryBackend(
+        "math",
+        remote,
+        work_dir=tmp_path / "work",
+        cache_dir=tmp_path / "cache",
+    )
+
+    initial = backend.resolve_release()
+    assert remote.is_dir()
+    assert run_git("--git-dir", str(remote), "rev-parse", "refs/reef/base") == initial.release_id
+    assert run_git("-C", str(tmp_path / "work" / "repository"), "config", "--local", "core.hooksPath") == str(
+        tmp_path / "work" / "repository" / ".git" / "reef-hooks"
+    )
+    assert not hasattr(backend.fork(), "scenario")
+
+
+@pytest.mark.integration
+def test_local_repository_base_carries_the_bootstrap_files_and_an_existing_base_wins(
+    tmp_path: Path,
+    fake_git_lfs: None,
+) -> None:
+    """A recipe's seed lands in the base artifact of a new local repository, so a fresh scenario
+    forks a tree with files; a later constructor with a different seed keeps the base that exists."""
+    remote = tmp_path / "artifacts.git"
+    seeded = GitLFSRepositoryBackend(
+        "first",
+        remote,
+        work_dir=tmp_path / "work-first",
+        cache_dir=tmp_path / "cache",
+        bootstrap_files={"pi-agent/AGENTS.md": "seed rules\n", "pi-agent/skills/a/SKILL.md": "# a\n"},
+    )
+    base = seeded.resolve_release()
+    tree = seeded.materialize(base).local_path
+    assert tree is not None
+    assert (tree / "pi-agent" / "AGENTS.md").read_text(encoding="utf-8") == "seed rules\n"
+    assert (tree / "pi-agent" / "skills" / "a" / "SKILL.md").read_text(encoding="utf-8") == "# a\n"
+    later = GitLFSRepositoryBackend(
+        "second",
+        remote,
+        work_dir=tmp_path / "work-second",
+        cache_dir=tmp_path / "cache",
+        bootstrap_files={"pi-agent/AGENTS.md": "other rules\n"},
+    )
+    assert later.resolve_release().release_id == base.release_id
+    kept = later.materialize(later.resolve_release()).local_path
+    assert kept is not None
+    assert (kept / "pi-agent" / "AGENTS.md").read_text(encoding="utf-8") == "seed rules\n"
+
+
+@pytest.mark.integration
+def test_local_repository_bootstrap_recovers_after_missing_git_lfs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_git = shutil.which("git")
+    assert real_git is not None
+    executable_dir = tmp_path / "bin"
+    executable_dir.mkdir()
+    git = executable_dir / "git"
+    git.write_text(f'#!/bin/sh\nexec {real_git} "$@"\n')
+    git.chmod(0o755)
+    monkeypatch.setenv("PATH", str(executable_dir))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+
+    remote = tmp_path / "artifacts.git"
+    with pytest.raises(ArtifactSourceError, match="git lfs version"):
+        GitLFSRepositoryBackend.factory(
+            remote,
+            work_dir=tmp_path / "failed-work",
+            cache_dir=tmp_path / "failed-cache",
+        )
+    assert not remote.exists()
+    assert not (tmp_path / "failed-work").exists()
+    assert not (tmp_path / "failed-cache").exists()
+
+    # Recreate the empty directory left by constructors from before this fix.
+    subprocess.run([real_git, "init", "--bare", str(remote)], check=True, capture_output=True)
+
+    git_lfs = executable_dir / "git-lfs"
+    git_lfs.write_text("#!/bin/sh\nexit 0\n")
+    git_lfs.chmod(0o755)
+    backend_factory = GitLFSRepositoryBackend.factory(
+        remote,
+        work_dir=tmp_path / "retry-work",
+        cache_dir=tmp_path / "retry-cache",
+    )
+    backend = backend_factory("math")
+
+    initial = backend.resolve_release()
+    assert run_git("--git-dir", str(remote), "rev-parse", "refs/reef/base") == initial.release_id
+    assert run_git("--git-dir", str(remote), "rev-parse", "refs/reef/head") == initial.release_id
+
+
+@pytest.mark.integration
+def test_local_repository_bootstrap_repairs_missing_latest(
+    tmp_path: Path,
+    fake_git_lfs: None,
+) -> None:
+    remote = tmp_path / "artifacts.git"
+    first = GitLFSRepositoryBackend(
+        "math",
+        remote,
+        work_dir=tmp_path / "first-work",
+        cache_dir=tmp_path / "first-cache",
+    )
+    initial = first.resolve_release()
+    run_git("--git-dir", str(remote), "update-ref", "-d", "refs/reef/head")
+
+    recovered = GitLFSRepositoryBackend(
+        "math",
+        remote,
+        work_dir=tmp_path / "recovered-work",
+        cache_dir=tmp_path / "recovered-cache",
+    )
+
+    assert recovered.resolve_release() == initial
+    assert run_git("--git-dir", str(remote), "rev-parse", "refs/reef/head") == initial.release_id
+
+
+@pytest.mark.integration
+def test_local_repository_bootstrap_is_idempotent_across_constructors(
+    tmp_path: Path,
+    fake_git_lfs: None,
+) -> None:
+    remote = tmp_path / "artifacts.git"
+
+    def build(index: int):
+        backend = GitLFSRepositoryBackend(
+            f"scenario-{index}",
+            remote,
+            work_dir=tmp_path / f"work-{index}",
+            cache_dir=tmp_path / f"cache-{index}",
+        )
+        return backend.resolve_release()
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        versions = tuple(executor.map(build, range(8)))
+
+    assert len({version.release_id for version in versions}) == 1
+    assert run_git("--git-dir", str(remote), "rev-parse", "refs/reef/base") == versions[0].release_id
+    assert run_git("--git-dir", str(remote), "rev-parse", "refs/reef/head") == versions[0].release_id
+
+
+@pytest.mark.integration
+def test_git_lfs_repository_imports_forks_publishes_and_materializes(
+    tmp_path: Path,
+    fake_git_lfs: None,
+) -> None:
+    remote = tmp_path / "artifacts.git"
+    run_git("init", "--bare", str(remote))
+
+    snapshot = tmp_path / "models--org--model" / "snapshots" / "upstream-sha"
+    snapshot.mkdir(parents=True)
+    blob = tmp_path / "hub-cache" / "blob"
+    blob.parent.mkdir()
+    blob.write_text("base")
+    (snapshot / "model.safetensors").symlink_to(blob)
+    (snapshot / "config.json").write_text("{}")
+
+    backend_factory = GitLFSRepositoryBackend.factory(
+        remote,
+        "org/model@main",
+        work_dir=tmp_path / "work",
+        cache_dir=tmp_path / "cache",
+        snapshot_download=lambda **kwargs: str(snapshot),
+    )
+
+    backend = backend_factory("math")
+    code_backend = backend_factory("code")
+    initial = backend.resolve_release()
+    assert run_git("--git-dir", str(remote), "rev-parse", "refs/reef/base") == initial.release_id
+    assert run_git("--git-dir", str(remote), "rev-parse", "refs/reef/head") == initial.release_id
+
+    math = backend.fork(metadata={"scenario_commit_record": {"recipe": "openclawrl"}})
+    code = code_backend.fork()
+    manifest = json.loads(run_git("--git-dir", str(remote), "show", f"{math.release_id}:reef-artifact.json"))
+    assert math.release_id != code.release_id
+    assert "scenario" not in manifest
+    assert backend.fork() == math
+    assert backend.metadata() == {"scenario_commit_record": {"recipe": "openclawrl"}}
+    assert run_git("--git-dir", str(remote), "rev-parse", backend.ref_name) == math.release_id
+
+    fresh_factory = GitLFSRepositoryBackend.factory(
+        remote,
+        work_dir=tmp_path / "fresh-work",
+        cache_dir=tmp_path / "fresh-cache",
+    )
+    assert fresh_factory.has_registration("math")
+    assert not fresh_factory.has_registration("unregistered")
+    assert not (tmp_path / "fresh-work").exists()
+    assert not (tmp_path / "fresh-cache").exists()
+
+    materialized = backend.materialize(math)
+    assert materialized.local_path.joinpath("model.safetensors").read_text() == "base"
+    assert not materialized.local_path.joinpath("model.safetensors").is_symlink()
+    assert "*.safetensors filter=lfs" in materialized.local_path.joinpath(".gitattributes").read_text()
+
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    (candidate / "adapter.safetensors").write_text("trained")
+    published = backend.publish(
+        Artifact.local(candidate, metadata={"loss": "sft"}),
+        expected_parent=math,
+    )
+
+    assert published.parent_release_id == math.release_id
+    assert backend.current() == published
+    assert code_backend.current() == code
+    assert backend.materialize(published).local_path.joinpath("adapter.safetensors").read_text() == "trained"
+    fresh = fresh_factory("math")
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        copies = tuple(executor.map(fresh.materialize, (published,) * 8))
+    assert all(copy.local_path.joinpath("adapter.safetensors").read_text() == "trained" for copy in copies)
+
+    with pytest.raises(ArtifactConflict):
+        backend.publish(Artifact.local(candidate), expected_parent=math)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("hook_source", ["none", "global", "template"])
+def test_fresh_scenario_forks_latest_artifact_with_real_lfs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hook_source: str,
+) -> None:
+    global_config = tmp_path / "gitconfig"
+    global_config.touch()
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    hooks = tmp_path / "template" / "hooks"
+    hooks.mkdir(parents=True)
+    hook_contents = "#!/bin/sh\necho 'unrelated user hook must not run' >&2\nexit 1\n"
+    for name in ("pre-push", "post-checkout"):
+        hook = hooks / name
+        hook.write_text(hook_contents)
+        hook.chmod(0o755)
+    if hook_source == "global":
+        run_git("config", "--global", "core.hooksPath", str(hooks))
+    elif hook_source == "template":
+        monkeypatch.setenv("GIT_TEMPLATE_DIR", str(hooks.parent))
+    original_config = global_config.read_text()
+    remote = tmp_path / "artifacts.git"
+    first = GitLFSRepositoryBackend(
+        "scenario-a",
+        remote,
+        work_dir=tmp_path / "work-a",
+        cache_dir=tmp_path / "cache-a",
+    )
+    initial = first.fork()
+    candidate = tmp_path / "trained"
+    candidate.mkdir()
+    weights = candidate / "model-00001-of-00001.safetensors"
+    weights.write_bytes(b"trained weights")
+    trained = first.publish(Artifact.local(candidate), expected_parent=initial)
+
+    second = GitLFSRepositoryBackend(
+        "scenario-b",
+        remote,
+        work_dir=tmp_path / "work-b",
+        cache_dir=tmp_path / "cache-b",
+    )
+    forked = second.fork(metadata={"source_scenario": "scenario-a"})
+
+    assert forked.parent_release_id == trained.release_id
+    assert second.metadata() == {"source_scenario": "scenario-a"}
+    assert run_git("--git-dir", str(remote), "rev-parse", second.ref_name) == forked.release_id
+    inherited_weights = tmp_path / "work-b" / "repository" / weights.name
+    assert inherited_weights.read_text().startswith("version https://git-lfs.github.com/spec/v1")
+
+    fresh = GitLFSRepositoryBackend(
+        "scenario-b",
+        remote,
+        work_dir=tmp_path / "fresh-work",
+        cache_dir=tmp_path / "fresh-cache",
+    )
+    materialized = fresh.materialize(forked)
+    assert materialized.local_path is not None
+    assert materialized.local_path.joinpath(weights.name).read_bytes() == b"trained weights"
+    assert not (materialized.local_path / ".git").exists()
+    assert global_config.read_text() == original_config
+    for name in ("pre-push", "post-checkout"):
+        assert (hooks / name).read_text() == hook_contents
+        if hook_source == "template":
+            assert (tmp_path / "fresh-work" / "repository" / ".git" / "hooks" / name).read_text() == hook_contents
+
+
+@pytest.mark.integration
+def test_archiving_a_scenario_renames_its_ref_and_drops_its_work_clone(tmp_path: Path, fake_git_lfs: None) -> None:
+    """The factory's archive moves ``refs/reef/scenarios/<name>`` under ``refs/reef/archived`` and removes
+    the scenario's work clone; the base ref and other scenarios stay, and the name is free again."""
+    remote = tmp_path / "artifacts.git"
+    factory = GitLFSRepositoryBackend.factory(remote, work_dir=tmp_path / "work", cache_dir=tmp_path / "cache")
+    factory("kept").fork()
+    doomed_ref = factory("doomed").fork()
+    assert set(factory.list_registrations()) == {"doomed", "kept"}
+    encoded = base64.urlsafe_b64encode(b"doomed").decode().rstrip("=")
+    assert (tmp_path / "work" / encoded).is_dir()
+
+    archived = factory.archive_registration("doomed")
+
+    assert factory.list_registrations() == ("kept",)
+    assert not factory.has_registration("doomed")
+    assert len(archived) == 2 and archived[0].startswith("refs/reef/archived/")
+    assert run_git("--git-dir", str(remote), "rev-parse", archived[0]) == doomed_ref.release_id
+    assert run_git("--git-dir", str(remote), "rev-parse", "refs/reef/base")
+    assert not (tmp_path / "work" / encoded).exists()
+    # The name creates fresh: a new backend forks the base again rather than continuing the archived chain.
+    fresh = factory("doomed")
+    assert fresh.metadata() is None
+    assert fresh.fork().parent_release_id == run_git("--git-dir", str(remote), "rev-parse", "refs/reef/base")
